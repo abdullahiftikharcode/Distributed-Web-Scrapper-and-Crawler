@@ -552,7 +552,7 @@ def main():
                 st.session_state.confirm_start = True
                 st.session_state.show_worker_input = True
                 st.write("Start All Services button clicked!")  # Debug log
-                st.experimental_rerun()  # Force a rerun to update the UI
+                st.rerun()  # Force a rerun to update the UI
         else:
             if st.session_state.show_worker_input:
                 st.session_state.worker_count = st.number_input(
@@ -568,12 +568,12 @@ def main():
                         st.success("All services started successfully!")
                         st.session_state.confirm_start = False
                         st.session_state.show_worker_input = False
-                        st.experimental_rerun()  # Force a rerun to update the UI
+                        st.rerun()  # Force a rerun to update the UI
                     else:
                         st.error("Failed to start services")
                         st.session_state.confirm_start = False
                         st.session_state.show_worker_input = False
-                        st.experimental_rerun()  # Force a rerun to update the UI
+                        st.rerun()  # Force a rerun to update the UI
     
     with col2:
         if st.button("Stop All Services", type="secondary", key="stop_services"):
@@ -582,7 +582,7 @@ def main():
                 st.success("All services stopped successfully!")
                 st.session_state.confirm_start = False
                 st.session_state.show_worker_input = False
-                st.experimental_rerun()  # Force a rerun to update the UI
+                st.rerun()  # Force a rerun to update the UI
             else:
                 st.error("Failed to stop services")
     
