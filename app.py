@@ -403,6 +403,14 @@ def get_crawling_logs():
 
 def main():
     st.title("🕷️ Distributed Web Crawler Dashboard")
+    
+    # Add refresh button at the top
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.success("Data refreshed!")
+        st.rerun()
+    
+    # Service status check
     status = check_service_status()
     
     st.sidebar.header("Service Status")
