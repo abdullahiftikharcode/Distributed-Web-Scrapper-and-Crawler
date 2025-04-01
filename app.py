@@ -8,10 +8,11 @@ import os
 import subprocess
 import yaml
 import time
-import pika
+import requests
 import psutil
 import traceback
 import logging
+import pika
 
 # Set page config - must be the first Streamlit command
 st.set_page_config(
@@ -32,33 +33,60 @@ if 'url' not in st.session_state:
     st.session_state.url = "http://books.toscrape.com/"
 if 'num_workers' not in st.session_state:
     st.session_state.num_workers = 3
-if 'api_process' not in st.session_state:
-    st.session_state.api_process = None
-if 'scheduler_process' not in st.session_state:
-    st.session_state.scheduler_process = None
-if 'worker_processes' not in st.session_state:
-    st.session_state.worker_processes = []
+if 'scheduler_url' not in st.session_state:
+    st.session_state.scheduler_url = "http://scheduler:5001"
+if 'worker_urls' not in st.session_state:
+    st.session_state.worker_urls = ["http://worker:5000"]
 if 'confirm_start' not in st.session_state:
     st.session_state.confirm_start = False
 if 'show_worker_input' not in st.session_state:
     st.session_state.show_worker_input = False
 if 'worker_count' not in st.session_state:
-    st.session_state.worker_count = 3
+    st.session_state.worker_count = 1
 
 def check_rabbitmq():
     try:
+        logger.info("Attempting to connect to RabbitMQ...")
+        host = os.getenv('RABBITMQ_HOST', 'rabbitmq')
+        port = int(os.getenv('RABBITMQ_PORT', '5672'))
+        username = os.getenv('RABBITMQ_USER', 'admin')
+        password = os.getenv('RABBITMQ_PASS', 'admin')
+        
+        logger.info(f"RabbitMQ Connection Details:")
+        logger.info(f"Host: {host}")
+        logger.info(f"Port: {port}")
+        logger.info(f"Username: {username}")
+        
+        # Add a delay before first connection attempt
+        logger.info("Waiting for RabbitMQ to be fully ready...")
+        time.sleep(5)
+        
         connection = pika.BlockingConnection(
-            pika.ConnectionParameters('localhost')
+            pika.ConnectionParameters(
+                host=host,
+                port=port,
+                credentials=pika.PlainCredentials(username, password),
+                heartbeat=600,
+                blocked_connection_timeout=300,
+                connection_attempts=3,
+                retry_delay=5,
+                socket_timeout=5
+            )
         )
+        logger.info("Successfully connected to RabbitMQ")
         connection.close()
+        logger.info("Successfully closed RabbitMQ connection")
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error checking RabbitMQ: {str(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         return False
 
 def check_mongodb_installation():
     """Check if MongoDB is installed and running"""
     try:
-        client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
+        uri = os.getenv('MONGODB_URI', 'mongodb://mongodb:27017/')
+        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.server_info()
         client.close()
         return True
@@ -82,21 +110,26 @@ def check_service_status():
         'workers': []
     }
     
-    # Check scheduler
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            if 'python' in proc.info['name'] and 'scheduler.py' in ' '.join(proc.info['cmdline']):
-                status['scheduler'] = True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    
-    # Check workers
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            if 'python' in proc.info['name'] and 'worker.py' in ' '.join(proc.info['cmdline']):
-                status['workers'].append(proc.pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+    try:
+        # Check scheduler status
+        response = requests.get(f"{st.session_state.scheduler_url}/status")
+        if response.status_code == 200:
+            scheduler_status = response.json()
+            status['scheduler'] = scheduler_status.get('is_running', False)
+        
+        # Check worker statuses
+        for worker_url in st.session_state.worker_urls:
+            try:
+                response = requests.get(f"{worker_url}/status")
+                if response.status_code == 200:
+                    worker_status = response.json()
+                    if worker_status.get('is_running', False):
+                        status['workers'].append(worker_url)
+            except Exception as e:
+                logger.error(f"Error checking worker status at {worker_url}: {str(e)}")
+                
+    except Exception as e:
+        logger.error(f"Error checking service status: {str(e)}")
     
     return status
 
@@ -138,7 +171,8 @@ def get_database():
         show_service_setup_instructions()
     
     try:
-        client = pymongo.MongoClient("mongodb://localhost:27017/")
+        uri = os.getenv('MONGODB_URI', 'mongodb://mongodb:27017/')
+        client = pymongo.MongoClient(uri)
         db = client["web_crawler"]
         return db["pages"]
     except Exception as e:
@@ -191,190 +225,208 @@ def save_config(config):
         st.error(f"Error saving config: {str(e)}")
         return False
 
-def start_worker(worker_id):
-    try:
-        env = os.environ.copy()
-        env['WORKER_ID'] = str(worker_id)
-        logger.info(f"Starting worker {worker_id}...")
-        
-        # Start worker process without capturing stdout/stderr
-        process = subprocess.Popen(
-            ['python', 'worker.py'],
-            env=env,
-            creationflags=subprocess.CREATE_NEW_CONSOLE
-        )
-        
-        if process.poll() is None:
-            logger.info(f"Worker {worker_id} started successfully with PID {process.pid}")
-            return process.pid
-        else:
-            logger.error(f"Worker {worker_id} failed to start.")
-            st.error(f"Worker {worker_id} failed to start.")
-            return None
-    except Exception as e:
-        error_msg = f"Error starting worker {worker_id}: {str(e)}"
-        logger.error(error_msg)
-        st.error(error_msg)
-        return None
-
 def start_all_services():
+    """Start all services using their respective APIs"""
     try:
-        st.info("Starting all services...")
-        if not check_mongodb_installation():
-            st.error("MongoDB is not running. Please start MongoDB first.")
-            return
-        if not check_rabbitmq():
-            st.error("RabbitMQ is not running. Please start RabbitMQ first.")
-            return
-            
-        num_workers = st.session_state.get('worker_count', 3)
-        st.info(f"Starting {num_workers} workers...")
+        logger.info("Starting all services...")
+        success = True
         
-        config = load_config()
-        if not config:
-            st.error("Failed to load configuration")
-            return
-            
-        if 'crawler' not in config:
-            config['crawler'] = {}
-        config['crawler']['start_url'] = st.session_state.get('url', '')
-        
-        with open('config.yaml', 'w') as f:
-            yaml.dump(config, f)
-            
+        # Start scheduler
+        logger.info(f"Starting scheduler at {st.session_state.scheduler_url}")
         try:
-            client = pymongo.MongoClient("mongodb://localhost:27017/")
-            db = client["web_crawler"]
-            db.pages.delete_many({})
-            db.visited_urls.delete_many({})
-            db.url_queue.delete_many({})
-            st.success("Cleared existing data")
-        except Exception as e:
-            st.error(f"Error clearing data: {str(e)}")
-            return
-            
-        try:
-            api_process = subprocess.Popen(
-                ['python', 'api.py'],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+            response = requests.post(
+                f"{st.session_state.scheduler_url}/start",
+                timeout=5,
+                verify=False
             )
-            st.session_state['api_process'] = api_process
-            st.success("Started API server")
+            if response.status_code != 200:
+                error_msg = f"Error starting scheduler: {response.text}"
+                logger.error(error_msg)
+                st.error(error_msg)
+                success = False
+            else:
+                logger.info("Successfully started scheduler")
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"Connection error starting scheduler: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            st.error(error_msg)
+            success = False
+        except requests.exceptions.Timeout as e:
+            error_msg = f"Timeout error starting scheduler: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            st.error(error_msg)
+            success = False
         except Exception as e:
-            st.error(f"Error starting API server: {str(e)}")
-            return
+            error_msg = f"Error starting scheduler: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            st.error(error_msg)
+            success = False
             
-        try:
-            # Start scheduler without capturing stdout/stderr
-            scheduler_process = subprocess.Popen(
-                ['python', 'scheduler.py'],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            st.session_state['scheduler_process'] = scheduler_process
-            st.success("Started scheduler")
-            time.sleep(2)
-            if scheduler_process.poll() is not None:
-                st.error("Scheduler failed to start.")
-                return
-        except Exception as e:
-            st.error(f"Error starting scheduler: {str(e)}")
-            return
-            
-        worker_processes = []
-        for i in range(num_workers):
+        # Start workers
+        logger.info(f"Starting {len(st.session_state.worker_urls)} workers...")
+        for i, worker_url in enumerate(st.session_state.worker_urls):
             try:
-                env = os.environ.copy()
-                env['WORKER_ID'] = str(i)
-                # Start worker process without capturing stdout/stderr
-                worker_process = subprocess.Popen(
-                    ['python', 'worker.py'],
-                    env=env,
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                logger.info(f"Starting worker {i+1} at {worker_url}")
+                worker_id = f"worker_{i+1}"
+                response = requests.post(
+                    f"{worker_url}/start",
+                    json={"worker_id": worker_id},
+                    timeout=5,
+                    verify=False
                 )
-                worker_processes.append(worker_process)
-                st.success(f"Started worker {i}")
-                st.write(f"Worker {i} process ID: {worker_process.pid}")
-                time.sleep(2)  # Give worker time to start
-                if worker_process.poll() is not None:
-                    st.error(f"Worker {i} failed to start.")
-                    return
+                if response.status_code != 200:
+                    error_msg = f"Error starting worker {worker_id}: {response.text}"
+                    logger.error(error_msg)
+                    st.error(error_msg)
+                    success = False
+                else:
+                    logger.info(f"Successfully started worker {worker_id}")
+            except requests.exceptions.ConnectionError as e:
+                error_msg = f"Connection error starting worker {i+1}: {str(e)}"
+                logger.error(error_msg)
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                st.error(error_msg)
+                success = False
+            except requests.exceptions.Timeout as e:
+                error_msg = f"Timeout error starting worker {i+1}: {str(e)}"
+                logger.error(error_msg)
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                st.error(error_msg)
+                success = False
             except Exception as e:
-                st.error(f"Error starting worker {i}: {str(e)}")
-                return
+                error_msg = f"Error starting worker {i+1}: {str(e)}"
+                logger.error(error_msg)
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                st.error(error_msg)
+                success = False
                 
-        st.session_state['worker_processes'] = worker_processes
-        st.success("All services started successfully!")
-        st.write("Process IDs:")
-        st.write(f"API Server: {api_process.pid}")
-        st.write(f"Scheduler: {scheduler_process.pid}")
-        for i, proc in enumerate(worker_processes):
-            st.write(f"Worker {i}: {proc.pid}")
-            
+        return success
     except Exception as e:
-        st.error(f"Error starting services: {str(e)}")
-        st.error(traceback.format_exc())
+        error_msg = f"Error starting services: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        st.error(error_msg)
+        return False
 
 def stop_all_services():
+    """Stop all running services using their respective APIs"""
     try:
-        for proc in psutil.process_iter(['name', 'cmdline']):
+        logger.info("Stopping all services...")
+        success = True
+        
+        # Stop scheduler
+        try:
+            response = requests.post(f"{st.session_state.scheduler_url}/stop")
+            if response.status_code != 200:
+                error_msg = f"Error stopping scheduler: {response.text}"
+                logger.error(error_msg)
+                st.error(error_msg)
+                success = False
+            else:
+                logger.info("Successfully stopped scheduler")
+        except Exception as e:
+            error_msg = f"Error stopping scheduler: {str(e)}"
+            logger.error(error_msg)
+            st.error(error_msg)
+            success = False
+        
+        # Stop workers
+        for i, worker_url in enumerate(st.session_state.worker_urls):
             try:
-                if 'python' in proc.info['name']:
-                    cmdline = ' '.join(proc.info['cmdline'])
-                    if 'scheduler.py' in cmdline or 'worker.py' in cmdline or 'api.py' in cmdline:
-                        proc.terminate()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return True
+                response = requests.post(f"{worker_url}/stop")
+                if response.status_code != 200:
+                    error_msg = f"Error stopping worker {i+1}: {response.text}"
+                    logger.error(error_msg)
+                    st.error(error_msg)
+                    success = False
+                else:
+                    logger.info(f"Successfully stopped worker {i+1}")
+            except Exception as e:
+                error_msg = f"Error stopping worker {i+1}: {str(e)}"
+                logger.error(error_msg)
+                st.error(error_msg)
+                success = False
+        
+        # Clear session state
+        st.session_state.worker_urls = []
+        st.session_state.confirm_start = False
+        st.session_state.show_worker_input = False
+        
+        if success:
+            logger.info("All services stopped successfully")
+            st.success("Successfully stopped all services!")
+        return success
+            
     except Exception as e:
+        logger.error(f"Error stopping services: {str(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         st.error(f"Error stopping services: {str(e)}")
-    return False
+        return False
 
 def check_api_status():
     try:
+        # Try to connect to the API endpoint
+        api_url = os.getenv('API_URL', 'http://api:5002')
+        response = requests.get(f"{api_url}/health", timeout=2)
+        if response.status_code == 200:
+            return True
+            
+        # Fall back to process check if HTTP request fails
         for proc in psutil.process_iter(['name', 'cmdline']):
             try:
-                if 'python' in proc.info['name'] and 'api.py' in ' '.join(proc.info['cmdline']):
+                cmdline = ' '.join(proc.info.get('cmdline', []))
+                if 'python' in proc.info.get('name', '') and ('api_server.py' in cmdline or 'api.py' in cmdline):
                     return True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         return False
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error checking API status: {str(e)}")
         return False
 
 def get_worker_details():
     try:
-        client = pymongo.MongoClient("mongodb://localhost:27017/")
-        db = client["web_crawler"]
-        collection = db["pages"]
-        documents = list(collection.find())
         worker_stats = {}
-        for doc in documents:
-            worker_id = doc.get('worker_id', 'unknown')
-            if worker_id not in worker_stats:
-                worker_stats[worker_id] = {
-                    'pages_crawled': 0,
-                    'max_depth': 0,
-                    'last_url': None,
-                    'last_timestamp': None,
-                    'errors': 0
-                }
-            stats = worker_stats[worker_id]
-            stats['pages_crawled'] += 1
-            stats['max_depth'] = max(stats['max_depth'], doc.get('depth', 0))
-            timestamp = doc.get('timestamp', 0)
-            if stats['last_timestamp'] is None or timestamp > stats['last_timestamp']:
-                stats['last_url'] = doc.get('url')
-                stats['last_timestamp'] = timestamp
-            if 'error' in doc:
-                stats['errors'] += 1
+        for i, worker_url in enumerate(st.session_state.worker_urls):
+            try:
+                response = requests.get(f"{worker_url}/stats")
+                if response.status_code == 200:
+                    stats = response.json()
+                    stats['worker_id'] = str(i + 1)
+                    worker_stats[str(i + 1)] = stats
+            except Exception as e:
+                logger.error(f"Error getting stats for worker {i+1}: {str(e)}")
         return worker_stats
     except Exception as e:
         st.error(f"Error getting worker details: {str(e)}")
         return {}
 
+def get_queue_stats():
+    try:
+        response = requests.get(f"{st.session_state.scheduler_url}/queue_stats")
+        if response.status_code == 200:
+            return response.json()
+        return {
+            'pending_count': 0,
+            'processing_count': 0,
+            'completed_count': 0,
+            'failed_count': 0
+        }
+    except Exception as e:
+        st.error(f"Error getting queue stats: {str(e)}")
+        return {
+            'pending_count': 0,
+            'processing_count': 0,
+            'completed_count': 0,
+            'failed_count': 0
+        }
+
 def get_crawling_logs():
     try:
-        client = pymongo.MongoClient("mongodb://localhost:27017/")
+        client = pymongo.MongoClient("mongodb://mongodb:27017/")
         db = client["web_crawler"]
         visited_urls = list(db.visited_urls.find().sort("timestamp", -1).limit(50))
         pages = list(db.pages.find().sort("timestamp", -1).limit(50))
@@ -400,6 +452,52 @@ def get_crawling_logs():
     except Exception as e:
         st.error(f"Error getting crawling logs: {str(e)}")
         return []
+
+def scale_workers(num_workers):
+    """Scale the number of workers up or down"""
+    try:
+        # Get current worker count
+        current_workers = len(st.session_state.get('worker_urls', []))
+        
+        if num_workers > current_workers:
+            # Scale up
+            for i in range(current_workers, num_workers):
+                worker_url = f"http://localhost:{5000 + i}"
+                try:
+                    response = requests.post(
+                        f"{worker_url}/start",
+                        json={'worker_id': str(i + 1)}
+                    )
+                    if response.status_code != 200:
+                        error_msg = f"Error starting worker {i+1}: {response.text}"
+                        logger.error(error_msg)
+                        st.error(error_msg)
+                    else:
+                        logger.info(f"Successfully started worker {i+1}")
+                except Exception as e:
+                    error_msg = f"Error starting worker {i+1}: {str(e)}"
+                    logger.error(error_msg)
+                    st.error(error_msg)
+        elif num_workers < current_workers:
+            # Scale down
+            for i in range(current_workers - 1, num_workers - 1, -1):
+                worker_url = f"http://localhost:{5000 + i}"
+                try:
+                    response = requests.post(f"{worker_url}/stop")
+                    if response.status_code != 200:
+                        error_msg = f"Error stopping worker {i+1}: {response.text}"
+                        logger.error(error_msg)
+                        st.error(error_msg)
+                except Exception as e:
+                    error_msg = f"Error stopping worker {i+1}: {str(e)}"
+                    logger.error(error_msg)
+                    st.error(error_msg)
+        
+        st.success(f"Successfully scaled to {num_workers} workers")
+        return True
+    except Exception as e:
+        st.error(f"Error scaling workers: {str(e)}")
+        return False
 
 def main():
     st.title("🕷️ Distributed Web Crawler Dashboard")
@@ -441,6 +539,29 @@ def main():
         st.sidebar.warning("Workers: Not Running")
     
     st.sidebar.markdown("---")
+    st.sidebar.header("Worker Controls")
+    
+    # Worker scaling controls
+    if status['scheduler']:  # Only show scaling controls if scheduler is running
+        current_workers = len(status['workers'])
+        # Ensure current_workers is at least 1 to avoid the StreamlitAPIException
+        current_workers = max(1, current_workers)
+        new_worker_count = st.sidebar.number_input(
+            "Number of Workers",
+            min_value=1,
+            max_value=10,
+            value=current_workers,
+            help="Adjust the number of worker nodes (1-10)"
+        )
+        
+        if new_worker_count != current_workers:
+            if st.sidebar.button("Scale Workers"):
+                if scale_workers(new_worker_count):
+                    st.rerun()
+    else:
+        st.sidebar.info("Start the scheduler first to enable worker scaling")
+    
+    st.sidebar.markdown("---")
     st.sidebar.header("Worker Details")
     worker_stats = get_worker_details()
     
@@ -462,48 +583,83 @@ def main():
     st.sidebar.header("Service Controls")
     url = st.sidebar.text_input("Enter URL to scrape", "http://books.toscrape.com/")
     st.session_state['url'] = url
+    
+    # Service control buttons
     col1, col2 = st.sidebar.columns(2)
     
     with col1:
+        # Initial "Start All Services" button
         if not st.session_state.confirm_start:
             if st.button("Start All Services", type="primary", key="start_services"):
+                logger.info("Start All Services button clicked")
+                # Check service status before proceeding
+                status = check_service_status()
+                if not status['mongodb']:
+                    st.error("MongoDB is not running. Please start MongoDB first.")
+                    return
+                if not status['rabbitmq']:
+                    st.error("RabbitMQ is not running. Please start RabbitMQ first.")
+                    return
+                    
                 st.session_state.confirm_start = True
                 st.session_state.show_worker_input = True
-                st.write("Start All Services button clicked!")
-                st.rerun()  # Force a rerun to update the UI
-        else:
-            if st.session_state.show_worker_input:
-                st.session_state.worker_count = st.number_input(
-                    "How many worker nodes do you want to create?",
-                    min_value=1,
-                    max_value=10,
-                    value=st.session_state.worker_count,
-                    key="worker_count_input"
-                )
-                if st.button("Confirm and Start All Services", type="secondary", key="confirm_services"):
-                    st.write("Confirm button clicked! Starting services...")
-                    if start_all_services():
-                        st.success("All services started successfully!")
-                        st.session_state.confirm_start = False
-                        st.session_state.show_worker_input = False
-                        st.rerun()  # Force a rerun to update the UI
-                    else:
-                        st.error("Failed to start services")
-                        st.session_state.confirm_start = False
-                        st.session_state.show_worker_input = False
-                        st.rerun()  # Force a rerun to update the UI
+                st.rerun()
+        
+        # Worker count input and confirmation button
+        elif st.session_state.show_worker_input:
+            st.session_state.worker_count = st.number_input(
+                "How many worker nodes?",
+                min_value=1,
+                max_value=10,
+                value=st.session_state.worker_count,
+                key="worker_count_input"
+            )
+            
+            # Confirm and Start All Services button
+            if st.button("Confirm and Start All Services", type="secondary", key="confirm_services"):
+                logger.info("Confirm and Start All Services button clicked")
+                # Double check service status
+                status = check_service_status()
+                if not status['mongodb']:
+                    st.error("MongoDB is not running. Please start MongoDB first.")
+                    st.session_state.confirm_start = False
+                    st.session_state.show_worker_input = False
+                    st.rerun()
+                    return
+                if not status['rabbitmq']:
+                    st.error("RabbitMQ is not running. Please start RabbitMQ first.")
+                    st.session_state.confirm_start = False
+                    st.session_state.show_worker_input = False
+                    st.rerun()
+                    return
+                    
+                # Start all services
+                logger.info(f"Starting services with {st.session_state.worker_count} workers")
+                if start_all_services():
+                    logger.info("Services started successfully")
+                    st.session_state.confirm_start = False
+                    st.session_state.show_worker_input = False
+                    st.rerun()
+                else:
+                    logger.error("Failed to start services")
+                    st.session_state.confirm_start = False
+                    st.session_state.show_worker_input = False
+                    st.rerun()
     
     with col2:
+        # Stop All Services button
         if st.button("Stop All Services", type="secondary", key="stop_services"):
-            st.write("Stop All Services button clicked!")
+            logger.info("Stop All Services button clicked")
             if stop_all_services():
+                logger.info("Services stopped successfully")
                 st.success("All services stopped successfully!")
                 st.session_state.confirm_start = False
                 st.session_state.show_worker_input = False
-                st.rerun()  # Force a rerun to update the UI
+                st.rerun()
             else:
+                logger.error("Failed to stop services")
                 st.error("Failed to stop services")
-    
+                
     st.sidebar.markdown("---")
     st.sidebar.header("Data Display")
     df = load_data()

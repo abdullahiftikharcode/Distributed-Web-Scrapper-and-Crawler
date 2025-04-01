@@ -18,8 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
-# Expose port for Streamlit
-EXPOSE 8501
+EXPOSE 5000
 
-# Command to run the application
-CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0"]
+# Command to run the worker
+CMD ["python", "worker_server.py"] 
