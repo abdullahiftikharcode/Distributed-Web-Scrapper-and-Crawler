@@ -9,7 +9,6 @@ from urllib.parse import urljoin, urlparse
 import os
 import requests
 from bs4 import BeautifulSoup
-import argparse
 
 # Configure logging
 logging.basicConfig(
@@ -34,111 +33,15 @@ class DistributedCrawler:
             logger.info("Successfully connected to MongoDB")
             
             # Load configuration
-            self.config = {
-                'crawler': {
-                    'allowed_domains': os.environ.get('CRAWLER_ALLOWED_DOMAINS', 'books.toscrape.com').split(','),
-                    'user_agent': os.environ.get('CRAWLER_USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'),
-                    'max_depth': int(os.environ.get('CRAWLER_MAX_DEPTH', '2')),
-                    'max_pages': int(os.environ.get('CRAWLER_MAX_PAGES', '1000')),
-                    'delay': float(os.environ.get('CRAWLER_DELAY', '1.0'))
-                },
-                'extraction_rules': {
-                    'title': {
-                        'selector': 'h1',
-                        'type': 'text'
-                    },
-                    'price': {
-                        'selector': '.price_color',
-                        'type': 'text'
-                    },
-                    'availability': {
-                        'selector': '.availability',
-                        'type': 'text'
-                    },
-                    'description': {
-                        'selector': '#product_description + p',
-                        'type': 'text'
-                    },
-                    'category': {
-                        'selector': '.breadcrumb li:nth-child(3) a',
-                        'type': 'text'
-                    },
-                    'rating': {
-                        'selector': '.star-rating',
-                        'type': 'text'
-                    },
-                    'product_type': {
-                        'selector': '.product_main',
-                        'type': 'text'
-                    },
-                    'price_excl_tax': {
-                        'selector': '.table-striped tr:nth-child(2) td',
-                        'type': 'text'
-                    },
-                    'price_incl_tax': {
-                        'selector': '.table-striped tr:nth-child(3) td',
-                        'type': 'text'
-                    },
-                    'tax': {
-                        'selector': '.table-striped tr:nth-child(4) td',
-                        'type': 'text'
-                    },
-                    'availability_count': {
-                        'selector': '.table-striped tr:nth-child(5) td',
-                        'type': 'text'
-                    },
-                    'number_of_reviews': {
-                        'selector': '.table-striped tr:nth-child(6) td',
-                        'type': 'text'
-                    }
-                }
-            }
-            logger.info("Successfully loaded configuration from environment variables")
+            with open('config.yaml', 'r') as f:
+                self.config = yaml.safe_load(f)
+            logger.info("Successfully loaded configuration")
             
             # Initialize RabbitMQ connection with detailed logging
             logger.info("Attempting to connect to RabbitMQ...")
             rabbit_host = os.environ.get("RABBITMQ_HOST", "localhost")
-            rabbit_port = int(os.environ.get("RABBITMQ_PORT", "5672"))
-            rabbit_user = os.environ.get("RABBITMQ_USER", "admin")
-            rabbit_pass = os.environ.get("RABBITMQ_PASS", "admin")
-            
-            logger.info(f"RabbitMQ Connection Details:")
-            logger.info(f"Host: {rabbit_host}")
-            logger.info(f"Port: {rabbit_port}")
-            logger.info(f"User: {rabbit_user}")
-            
-            credentials = pika.PlainCredentials(rabbit_user, rabbit_pass)
-            
-            # Add retry mechanism with exponential backoff for RabbitMQ connection
-            max_retries = 10
-            base_delay = 2  # seconds
-            max_delay = 30
-            for attempt in range(max_retries):
-                try:
-                    logger.info(f"Attempting to connect to RabbitMQ (attempt {attempt + 1}/{max_retries})...")
-                    self.connection = pika.BlockingConnection(
-                        pika.ConnectionParameters(
-                            host=rabbit_host,
-                            port=rabbit_port,
-                            credentials=credentials,
-                            heartbeat=600,
-                            blocked_connection_timeout=300,
-                            connection_attempts=3,
-                            retry_delay=5,
-                            socket_timeout=5
-                        )
-                    )
-                    logger.info("Successfully connected to RabbitMQ")
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        delay = min(base_delay * (2 ** attempt), max_delay)  # Exponential backoff with max delay
-                        logger.warning(f"Failed to connect to RabbitMQ (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                        logger.info(f"Retrying in {delay} seconds...")
-                        time.sleep(delay)
-                    else:
-                        logger.error(f"Failed to connect to RabbitMQ after {max_retries} attempts: {str(e)}")
-                        raise
+            self.connection = pika.BlockingConnection(pika.ConnectionParameters(rabbit_host))
+            logger.info("Successfully connected to RabbitMQ")
             
             self.channel = self.connection.channel()
             logger.info("Created RabbitMQ channel")
@@ -254,8 +157,8 @@ class DistributedCrawler:
         try:
             # Use findOneAndUpdate for atomic operation
             result = self.queue.find_one_and_update(
-                {"status": "pending"},  # Only get URLs with pending status
-                {"$set": {"status": "processing", "worker_id": self.worker_id, "processing_started": time.time()}},
+                {},
+                {"$set": {"worker_id": self.worker_id, "processing_started": time.time()}},
                 sort=[("timestamp", 1)],
                 return_document=pymongo.ReturnDocument.AFTER
             )
@@ -263,7 +166,7 @@ class DistributedCrawler:
             if result:
                 logger.info(f"Got next URL: {result['url']}")
                 return result["url"], result["depth"]
-            logger.debug("No pending URLs in queue")
+            logger.debug("No URLs in queue")
             return None, None
         except Exception as e:
             logger.error(f"Error getting next URL: {str(e)}")
@@ -466,173 +369,12 @@ class DistributedCrawler:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
 
-    def get_stats(self):
-        """Get crawling statistics"""
-        try:
-            # Get total pages crawled
-            total_pages = self.pages.count_documents({})
-            
-            # Get total visited URLs
-            total_visited = self.visited_urls.count_documents({})
-            
-            # Get queue size
-            queue_size = self.queue.count_documents({})
-            
-            # Get queue status breakdown
-            queue_status = self.queue.aggregate([
-                {'$group': {'_id': '$status', 'count': {'$sum': 1}}}
-            ])
-            queue_status_dict = {doc['_id']: doc['count'] for doc in queue_status}
-            
-            # Get last processed URL and timestamp
-            last_processed = self.queue.find_one(
-                {"status": "completed"},
-                sort=[("completed_at", -1)]
-            )
-            last_url = last_processed['url'] if last_processed else None
-            last_timestamp = last_processed['completed_at'] if last_processed else None
-            
-            # Get max depth from configuration
-            max_depth = self.config['crawler']['max_depth']
-            
-            stats = {
-                'pages_crawled': total_pages,
-                'total_visited': total_visited,
-                'queue_size': queue_size,
-                'worker_id': self.worker_id,
-                'status': 'running' if hasattr(self, 'connection') and not self.connection.is_closed else 'stopped',
-                'queue_status': queue_status_dict,
-                'last_url': last_url,
-                'last_timestamp': last_timestamp,
-                'max_depth': max_depth,
-                'errors': queue_status_dict.get('failed', 0)
-            }
-            
-            return stats
-        except Exception as e:
-            logger.error(f"Error getting stats: {str(e)}")
-            return {
-                'error': str(e),
-                'worker_id': self.worker_id,
-                'status': 'error',
-                'pages_crawled': 0,
-                'total_visited': 0,
-                'queue_size': 0,
-                'last_url': None,
-                'last_timestamp': None,
-                'max_depth': 0,
-                'errors': 0
-            }
-
-    def process_next_url(self):
-        """Process the next URL from the RabbitMQ queue"""
-        try:
-            # Get a message from RabbitMQ
-            method_frame, header_frame, body = self.channel.basic_get('url_queue')
-            
-            if method_frame:
-                try:
-                    # Parse message
-                    message = json.loads(body)
-                    url = message['url']
-                    depth = message.get('depth', 0)
-                    
-                    logger.info(f"Processing URL: {url} (depth: {depth})")
-                    
-                    # Process the URL
-                    success = self.process_url(url, depth)
-                    
-                    if success:
-                        # Acknowledge the message
-                        self.channel.basic_ack(method_frame.delivery_tag)
-                        logger.info(f"Successfully processed URL: {url}")
-                        # Reset counter since we processed a message
-                        self._empty_queue_counter = 0
-                        return True
-                    else:
-                        # Reject the message and requeue it
-                        self.channel.basic_reject(method_frame.delivery_tag, requeue=True)
-                        logger.warning(f"Failed to process URL: {url}")
-                        return False
-                        
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error decoding message: {str(e)}")
-                    # Reject the message without requeueing
-                    self.channel.basic_reject(method_frame.delivery_tag, requeue=False)
-                    return False
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
-                    # Reject the message and requeue it
-                    self.channel.basic_reject(method_frame.delivery_tag, requeue=True)
-                    return False
-            else:
-                # No message available in RabbitMQ
-                # Increment counter for consecutive empty queue attempts
-                if not hasattr(self, '_empty_queue_counter'):
-                    self._empty_queue_counter = 0
-                self._empty_queue_counter += 1
-                
-                # After 5 consecutive empty attempts, try getting a URL directly from MongoDB
-                if self._empty_queue_counter >= 5:
-                    logger.info(f"No messages in RabbitMQ queue for {self._empty_queue_counter} attempts. Checking MongoDB directly.")
-                    
-                    # Try to get a pending URL from MongoDB
-                    url, depth = self.get_next_url()
-                    if url:
-                        logger.info(f"Found pending URL in MongoDB: {url}")
-                        # Process the URL directly
-                        success = self.process_url(url, depth)
-                        if success:
-                            # Mark as completed in MongoDB
-                            self.queue.update_one(
-                                {"url": url, "status": "pending"},
-                                {"$set": {
-                                    "status": "completed",
-                                    "completed_at": time.time()
-                                }}
-                            )
-                            logger.info(f"Successfully processed URL from MongoDB: {url}")
-                            # Reset counter since we processed a URL
-                            self._empty_queue_counter = 0
-                            return True
-                        else:
-                            logger.warning(f"Failed to process URL from MongoDB: {url}")
-                            return False
-                    else:
-                        # If counter gets too high, reset it to prevent integer overflow
-                        if self._empty_queue_counter > 100:
-                            self._empty_queue_counter = 5
-                        logger.debug("No pending URLs found in MongoDB queue")
-                
-                time.sleep(1)  # Prevent CPU overuse
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error in process_next_url: {str(e)}")
-            time.sleep(5)  # Wait before retrying on error
-            return False
-
 if __name__ == "__main__":
-    # Create command line argument parser
-    parser = argparse.ArgumentParser(description='Start a distributed web crawler worker')
-    parser.add_argument('--worker-id', type=str, default=os.environ.get('WORKER_ID', '0'),
-                      help='Worker ID to use (default: from WORKER_ID env var or "0")')
-    parser.add_argument('--reset-db', action='store_true',
-                      help='Reset database (clear all URLs and pages) before starting')
-    
-    args = parser.parse_args()
+    # Get worker ID from environment variable
+    worker_id = os.environ.get('WORKER_ID', '0')
     
     # Create and run crawler
-    crawler = DistributedCrawler(args.worker_id)
-    
-    # Reset database if requested
-    if args.reset_db:
-        logger.info("Resetting database as requested via command line")
-        crawler.visited_urls.delete_many({})
-        crawler.pages.delete_many({})
-        crawler.queue.delete_many({})
-        logger.info("Database reset complete")
-    
+    crawler = DistributedCrawler(worker_id)
     try:
         crawler.run()
     except KeyboardInterrupt:

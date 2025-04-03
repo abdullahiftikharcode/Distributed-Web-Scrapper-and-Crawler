@@ -28,10 +28,10 @@ extraction_rules:
 mongodb:
   collection: pages
   database: web_crawler
-  uri: mongodb://mongodb:27017
+  uri: mongodb://localhost:27017
 rabbitmq:
-  host: rabbitmq
-  password: admin
+  host: localhost
+  password: guest
   port: 5672
   queue_name: url_queue
-  username: admin
+  username: guest

@@ -1,123 +1,62 @@
 version: '3.8'
 
 services:
-  mongodb:
-    image: mongo:latest
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 40s
-
   rabbitmq:
     image: rabbitmq:3-management
     ports:
       - "5672:5672"
       - "15672:15672"
     environment:
-      - RABBITMQ_DEFAULT_USER=admin
-      - RABBITMQ_DEFAULT_PASS=admin
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 40s
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    ports:
-      - "5002:5002"
-    environment:
-      - MONGODB_URI=mongodb://mongodb:27017/
-      - RABBITMQ_HOST=rabbitmq
-      - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=admin
-      - RABBITMQ_PASS=admin
-      - SCHEDULER_URL=http://scheduler:5001
-      - WORKER_URL=http://worker:5000
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      scheduler:
-        condition: service_started
-      worker:
-        condition: service_started
-
-  scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.scheduler
-    ports:
-      - "5001:5001"
-    environment:
-      - MONGODB_URI=mongodb://mongodb:27017/
-      - RABBITMQ_HOST=rabbitmq
-      - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=admin
-      - RABBITMQ_PASS=admin
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
+    build: .
     ports:
       - "5000:5000"
+    depends_on:
+      - mongodb
+      - rabbitmq
     environment:
-      - MONGODB_URI=mongodb://mongodb:27017/
+      - MONGODB_URI=mongodb://mongodb:27017
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=admin
-      - RABBITMQ_PASS=admin
-      - CRAWLER_ALLOWED_DOMAINS=books.toscrape.com
-      - CRAWLER_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36
-      - CRAWLER_MAX_DEPTH=2
-      - CRAWLER_MAX_PAGES=1000
-      - CRAWLER_DELAY=1.0
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "8501:8501"
+  worker:
+    build: .
+    command: python worker.py
+    depends_on:
+      - mongodb
+      - rabbitmq
     environment:
-      - MONGODB_URI=mongodb://mongodb:27017/
+      - MONGODB_URI=mongodb://mongodb:27017
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=admin
-      - RABBITMQ_PASS=admin
-      - API_URL=http://api:5002
-      - SCHEDULER_URL=http://scheduler:5001
-      - WORKER_URL=http://worker:5000
+    deploy:
+      replicas: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
     depends_on:
-      mongodb:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      scheduler:
-        condition: service_started
-      worker:
-        condition: service_started
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
 
 volumes:
-  mongodb_data:
+  mongodb_data: 
