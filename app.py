@@ -1,5 +1,6 @@
 import streamlit as st
 import pymongo
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -12,6 +13,10 @@ import pika
 import psutil
 import traceback
 import logging
+import threading
+import socket
+import json
+from server import CrawlerServer
 
 # Set page config - must be the first Streamlit command
 st.set_page_config(
@@ -30,20 +35,22 @@ logger = logging.getLogger(__name__)
 # Initialize session state
 if 'url' not in st.session_state:
     st.session_state.url = "http://books.toscrape.com/"
-if 'num_workers' not in st.session_state:
-    st.session_state.num_workers = 3
-if 'api_process' not in st.session_state:
-    st.session_state.api_process = None
-if 'scheduler_process' not in st.session_state:
-    st.session_state.scheduler_process = None
-if 'worker_processes' not in st.session_state:
-    st.session_state.worker_processes = []
-if 'confirm_start' not in st.session_state:
-    st.session_state.confirm_start = False
-if 'show_worker_input' not in st.session_state:
-    st.session_state.show_worker_input = False
-if 'worker_count' not in st.session_state:
-    st.session_state.worker_count = 3
+if 'server_started' not in st.session_state:
+    st.session_state.server_started = False
+if 'server_thread' not in st.session_state:
+    st.session_state.server_thread = None
+if 'server_instance' not in st.session_state:
+    st.session_state.server_instance = None
+if 'server_host' not in st.session_state:
+    st.session_state.server_host = '0.0.0.0'
+if 'server_port' not in st.session_state:
+    st.session_state.server_port = 5555
+if 'last_worker_count' not in st.session_state:
+    st.session_state.last_worker_count = 0
+if 'last_refresh' not in st.session_state:
+    st.session_state.last_refresh = datetime.now()
+if 'worker_events' not in st.session_state:
+    st.session_state.worker_events = []
 
 def check_rabbitmq():
     try:
@@ -62,11 +69,11 @@ def check_mongodb_installation():
         client.server_info()
         client.close()
         return True
-    except pymongo.errors.ServerSelectionTimeoutError:
+    except ServerSelectionTimeoutError:
         st.error("MongoDB is not running. Please start MongoDB first.")
         st.error("To start MongoDB, open a new terminal and run: mongod")
         return False
-    except pymongo.errors.ConnectionFailure:
+    except ConnectionFailure:
         st.error("Could not connect to MongoDB. Please check if MongoDB is installed and running.")
         st.error("To start MongoDB, open a new terminal and run: mongod")
         return False
@@ -78,26 +85,8 @@ def check_service_status():
     status = {
         'mongodb': check_mongodb_installation(),
         'rabbitmq': check_rabbitmq(),
-        'scheduler': False,
-        'workers': []
+        'server': st.session_state.server_started
     }
-    
-    # Check scheduler
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            if 'python' in proc.info['name'] and 'scheduler.py' in ' '.join(proc.info['cmdline']):
-                status['scheduler'] = True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    
-    # Check workers
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            if 'python' in proc.info['name'] and 'worker.py' in ' '.join(proc.info['cmdline']):
-                status['workers'].append(proc.pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    
     return status
 
 def show_service_setup_instructions():
@@ -191,224 +180,233 @@ def save_config(config):
         st.error(f"Error saving config: {str(e)}")
         return False
 
-def start_worker(worker_id):
+def start_server_thread():
+    """Start the server in a separate thread"""
     try:
-        env = os.environ.copy()
-        env['WORKER_ID'] = str(worker_id)
-        logger.info(f"Starting worker {worker_id}...")
+        if st.session_state.server_started:
+            st.warning("Server is already running")
+            return True
         
-        # Start worker process without capturing stdout/stderr
-        process = subprocess.Popen(
-            ['python', 'worker.py'],
-            env=env,
-            creationflags=subprocess.CREATE_NEW_CONSOLE
+        # Create server instance
+        server = CrawlerServer(
+            host=st.session_state.server_host,
+            port=st.session_state.server_port
         )
         
-        if process.poll() is None:
-            logger.info(f"Worker {worker_id} started successfully with PID {process.pid}")
-            return process.pid
-        else:
-            logger.error(f"Worker {worker_id} failed to start.")
-            st.error(f"Worker {worker_id} failed to start.")
-            return None
-    except Exception as e:
-        error_msg = f"Error starting worker {worker_id}: {str(e)}"
-        logger.error(error_msg)
-        st.error(error_msg)
-        return None
-
-def start_all_services():
-    try:
-        st.info("Starting all services...")
-        if not check_mongodb_installation():
-            st.error("MongoDB is not running. Please start MongoDB first.")
-            return
-        if not check_rabbitmq():
-            st.error("RabbitMQ is not running. Please start RabbitMQ first.")
-            return
-            
-        num_workers = st.session_state.get('worker_count', 3)
-        st.info(f"Starting {num_workers} workers...")
+        # Store server instance in session state
+        st.session_state.server_instance = server
         
+        # Create and start server thread
+        server_thread = threading.Thread(target=server.start)
+        server_thread.daemon = True
+        server_thread.start()
+        
+        # Store thread in session state
+        st.session_state.server_thread = server_thread
+        st.session_state.server_started = True
+        
+        logger.info("Server started in background thread")
+        st.success(f"Server started on {st.session_state.server_host}:{st.session_state.server_port}")
+        return True
+    except Exception as e:
+        logger.error(f"Error starting server: {str(e)}")
+        st.error(f"Failed to start server: {str(e)}")
+        return False
+
+def stop_server():
+    """Stop the running server"""
+    try:
+        if not st.session_state.server_started:
+            st.warning("Server is not running")
+            return True
+        
+        # Shutdown server
+        if st.session_state.server_instance:
+            st.session_state.server_instance.shutdown()
+        
+        # Reset session state
+        st.session_state.server_instance = None
+        st.session_state.server_thread = None
+        st.session_state.server_started = False
+        
+        logger.info("Server stopped")
+        st.success("Server stopped")
+        return True
+    except Exception as e:
+        logger.error(f"Error stopping server: {str(e)}")
+        st.error(f"Failed to stop server: {str(e)}")
+        return False
+
+def seed_initial_urls():
+    """Seed initial URLs to the crawler queue"""
+    try:
+        if not st.session_state.server_started:
+            st.error("Server is not running. Please start the server first.")
+            return False
+        
+        if not st.session_state.server_instance:
+            st.error("Server instance not found.")
+            return False
+        
+        # Get configuration
         config = load_config()
         if not config:
             st.error("Failed to load configuration")
-            return
-            
-        if 'crawler' not in config:
-            config['crawler'] = {}
-        config['crawler']['start_url'] = st.session_state.get('url', '')
+            return False
         
-        with open('config.yaml', 'w') as f:
-            yaml.dump(config, f)
-            
+        # Clear existing data
         try:
             client = pymongo.MongoClient("mongodb://localhost:27017/")
             db = client["web_crawler"]
             db.pages.delete_many({})
             db.visited_urls.delete_many({})
             db.url_queue.delete_many({})
-            st.success("Cleared existing data")
+            logger.info("Cleared existing data")
         except Exception as e:
+            logger.error(f"Error clearing data: {str(e)}")
             st.error(f"Error clearing data: {str(e)}")
-            return
-            
-        try:
-            api_process = subprocess.Popen(
-                ['python', 'api.py'],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            st.session_state['api_process'] = api_process
-            st.success("Started API server")
-        except Exception as e:
-            st.error(f"Error starting API server: {str(e)}")
-            return
-            
-        try:
-            # Start scheduler without capturing stdout/stderr
-            scheduler_process = subprocess.Popen(
-                ['python', 'scheduler.py'],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            st.session_state['scheduler_process'] = scheduler_process
-            st.success("Started scheduler")
-            time.sleep(2)
-            if scheduler_process.poll() is not None:
-                st.error("Scheduler failed to start.")
-                return
-        except Exception as e:
-            st.error(f"Error starting scheduler: {str(e)}")
-            return
-            
-        worker_processes = []
-        for i in range(num_workers):
-            try:
-                env = os.environ.copy()
-                env['WORKER_ID'] = str(i)
-                # Start worker process without capturing stdout/stderr
-                worker_process = subprocess.Popen(
-                    ['python', 'worker.py'],
-                    env=env,
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
-                worker_processes.append(worker_process)
-                st.success(f"Started worker {i}")
-                st.write(f"Worker {i} process ID: {worker_process.pid}")
-                time.sleep(2)  # Give worker time to start
-                if worker_process.poll() is not None:
-                    st.error(f"Worker {i} failed to start.")
-                    return
-            except Exception as e:
-                st.error(f"Error starting worker {i}: {str(e)}")
-                return
-                
-        st.session_state['worker_processes'] = worker_processes
-        st.success("All services started successfully!")
-        st.write("Process IDs:")
-        st.write(f"API Server: {api_process.pid}")
-        st.write(f"Scheduler: {scheduler_process.pid}")
-        for i, proc in enumerate(worker_processes):
-            st.write(f"Worker {i}: {proc.pid}")
-            
+            return False
+        
+        # Add initial URL to queue
+        start_url = config.get('crawler', {}).get('start_url', 'http://books.toscrape.com/')
+        result = st.session_state.server_instance.add_url_to_queue(start_url, 0, "scheduler")
+        
+        if result:
+            logger.info(f"Successfully seeded initial URL: {start_url}")
+            st.success(f"Successfully seeded initial URL: {start_url}")
+            return True
+        else:
+            logger.error("Failed to seed initial URL")
+            st.error("Failed to seed initial URL")
+            return False
     except Exception as e:
-        st.error(f"Error starting services: {str(e)}")
-        st.error(traceback.format_exc())
-
-def stop_all_services():
-    try:
-        for proc in psutil.process_iter(['name', 'cmdline']):
-            try:
-                if 'python' in proc.info['name']:
-                    cmdline = ' '.join(proc.info['cmdline'])
-                    if 'scheduler.py' in cmdline or 'worker.py' in cmdline or 'api.py' in cmdline:
-                        proc.terminate()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return True
-    except Exception as e:
-        st.error(f"Error stopping services: {str(e)}")
-    return False
-
-def check_api_status():
-    try:
-        for proc in psutil.process_iter(['name', 'cmdline']):
-            try:
-                if 'python' in proc.info['name'] and 'api.py' in ' '.join(proc.info['cmdline']):
-                    return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return False
-    except Exception:
+        logger.error(f"Error seeding initial URLs: {str(e)}")
+        st.error(f"Error seeding initial URLs: {str(e)}")
         return False
 
 def get_worker_details():
+    """Get worker details from the server"""
+    try:
+        if not st.session_state.server_started or not st.session_state.server_instance:
+            return {}
+        
+        # Get worker status from server
+        return {
+            'workers': st.session_state.server_instance.get_worker_status(),
+            'mongodb_workers': get_mongodb_worker_stats()
+        }
+    except Exception as e:
+        logger.error(f"Error getting worker details: {str(e)}")
+        return {}
+
+def get_mongodb_worker_stats():
+    """Get worker statistics from MongoDB"""
     try:
         client = pymongo.MongoClient("mongodb://localhost:27017/")
         db = client["web_crawler"]
-        collection = db["pages"]
-        documents = list(collection.find())
-        worker_stats = {}
-        for doc in documents:
-            worker_id = doc.get('worker_id', 'unknown')
-            if worker_id not in worker_stats:
-                worker_stats[worker_id] = {
-                    'pages_crawled': 0,
-                    'max_depth': 0,
-                    'last_url': None,
-                    'last_timestamp': None,
-                    'errors': 0
-                }
-            stats = worker_stats[worker_id]
-            stats['pages_crawled'] += 1
-            stats['max_depth'] = max(stats['max_depth'], doc.get('depth', 0))
-            timestamp = doc.get('timestamp', 0)
-            if stats['last_timestamp'] is None or timestamp > stats['last_timestamp']:
-                stats['last_url'] = doc.get('url')
-                stats['last_timestamp'] = timestamp
-            if 'error' in doc:
-                stats['errors'] += 1
-        return worker_stats
+        worker_status = db["worker_status"].find()
+        
+        # Process and return worker status data
+        workers = {}
+        for status in worker_status:
+            worker_id = status.get('worker_id')
+            workers[worker_id] = {
+                'status': status.get('status', 'unknown'),
+                'last_activity': status.get('last_activity'),
+                'address': status.get('address', 'unknown'),
+                'connected_at': status.get('connected_at'),
+                'current_url': status.get('current_url'),
+                'last_completed_url': status.get('last_completed_url')
+            }
+        
+        # Add page counts
+        for worker_id in workers:
+            workers[worker_id]['pages_crawled'] = db["pages"].count_documents({"worker_id": worker_id})
+        
+        return workers
     except Exception as e:
-        st.error(f"Error getting worker details: {str(e)}")
+        logger.error(f"Error getting MongoDB worker stats: {str(e)}")
+        return {}
+
+def get_url_queue_stats():
+    """Get URL queue statistics"""
+    try:
+        client = pymongo.MongoClient("mongodb://localhost:27017/")
+        db = client["web_crawler"]
+        
+        stats = {
+            'pending': db["url_queue"].count_documents({"status": "pending"}),
+            'processing': db["url_queue"].count_documents({"status": "processing"}),
+            'completed': db["url_queue"].count_documents({"status": "completed"}),
+            'failed': db["url_queue"].count_documents({"status": "failed"}),
+            'total': db["url_queue"].count_documents({})
+        }
+        
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting URL queue stats: {str(e)}")
         return {}
 
 def get_crawling_logs():
+    """Get recent crawling logs from MongoDB"""
     try:
         client = pymongo.MongoClient("mongodb://localhost:27017/")
         db = client["web_crawler"]
-        visited_urls = list(db.visited_urls.find().sort("timestamp", -1).limit(50))
-        pages = list(db.pages.find().sort("timestamp", -1).limit(50))
+        
+        # Get recent visited URLs
+        visited = list(db["visited_urls"].find().sort("timestamp", -1).limit(10))
+        
+        # Get recent completed pages
+        crawled = list(db["pages"].find().sort("timestamp", -1).limit(10))
+        
+        # Combine and format logs
         logs = []
-        for url in visited_urls:
+        for v in visited:
             logs.append({
-                'timestamp': url['timestamp'],
                 'type': 'visited',
-                'url': url['url'],
-                'worker_id': url.get('worker_id', 'unknown')
+                'url': v.get('url'),
+                'worker_id': v.get('worker_id'),
+                'timestamp': v.get('timestamp')
             })
-        for page in pages:
+        
+        for c in crawled:
             logs.append({
-                'timestamp': page['timestamp'],
                 'type': 'crawled',
-                'url': page['url'],
-                'title': page.get('title', 'No title'),
-                'price': page.get('price', 'N/A'),
-                'worker_id': page.get('worker_id', 'unknown')
+                'url': c.get('url'),
+                'worker_id': c.get('worker_id'),
+                'timestamp': c.get('timestamp'),
+                'title': c.get('title'),
+                'price': c.get('price')
             })
-        logs.sort(key=lambda x: x['timestamp'], reverse=True)
-        return logs
+        
+        # Sort by timestamp
+        logs.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+        
+        return logs[:20]  # Return most recent 20 logs
     except Exception as e:
-        st.error(f"Error getting crawling logs: {str(e)}")
+        logger.error(f"Error getting crawling logs: {str(e)}")
         return []
 
 def main():
     st.title("🕷️ Distributed Web Crawler Dashboard")
     
-    # Add refresh button at the top
-    if st.button("🔄 Refresh Data"):
-        st.cache_data.clear()
-        st.success("Data refreshed!")
-        st.rerun()
+    # Add refresh button and auto-refresh feature
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.session_state.last_refresh = datetime.now()
+            st.rerun()
+    with col2:
+        auto_refresh = st.checkbox("Auto-refresh (5s)", value=False)
+        if auto_refresh:
+            st.empty()
+            # Add auto-refresh mechanism that will force a rerun every 5 seconds
+            time.sleep(5)
+            st.session_state.last_refresh = datetime.now()
+            st.rerun()
+    with col3:
+        st.caption(f"Last updated: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
     
     # Service status check
     status = check_service_status()
@@ -424,165 +422,367 @@ def main():
     else:
         st.sidebar.error("RabbitMQ: Not Running")
     
-    if check_api_status():
-        st.sidebar.success("API Server: Running")
+    if status['server']:
+        st.sidebar.success("Server: Running")
     else:
-        st.sidebar.warning("API Server: Not Running")
+        st.sidebar.warning("Server: Not Running")
     
-    if status['scheduler']:
-        st.sidebar.success("Scheduler: Running")
-    else:
-        st.sidebar.warning("Scheduler: Not Running")
+    # Get and display worker details
+    worker_details = get_worker_details()
+    active_workers = worker_details.get('workers', [])
+    mongodb_workers = worker_details.get('mongodb_workers', {})
     
-    num_workers = len(status['workers'])
-    if num_workers > 0:
-        st.sidebar.success(f"Workers: {num_workers} Running")
-    else:
-        st.sidebar.warning("Workers: Not Running")
+    # Check for worker connection/disconnection events
+    current_worker_count = len(active_workers)
+    if current_worker_count > st.session_state.last_worker_count:
+        # Worker connected
+        st.session_state.worker_events.append({
+            'time': datetime.now(),
+            'type': 'connect',
+            'count': current_worker_count
+        })
+        st.toast(f"New worker connected! Total workers: {current_worker_count}", icon="🔌")
+    elif current_worker_count < st.session_state.last_worker_count:
+        # Worker disconnected
+        st.session_state.worker_events.append({
+            'time': datetime.now(),
+            'type': 'disconnect',
+            'count': current_worker_count
+        })
+        st.toast(f"Worker disconnected! Remaining workers: {current_worker_count}", icon="🔌")
+    
+    # Update the last worker count
+    st.session_state.last_worker_count = current_worker_count
     
     st.sidebar.markdown("---")
     st.sidebar.header("Worker Details")
-    worker_stats = get_worker_details()
     
-    if worker_stats:
-        for worker_id, stats in worker_stats.items():
-            with st.sidebar.expander(f"Worker {worker_id}"):
-                st.metric("Pages Crawled", stats['pages_crawled'])
-                st.metric("Current Depth", stats['max_depth'])
-                if stats['last_url']:
-                    st.text(f"Last URL: {stats['last_url']}")
-                if stats['last_timestamp']:
-                    st.text(f"Last Activity: {datetime.fromtimestamp(stats['last_timestamp']).strftime('%Y-%m-%d %H:%M:%S')}")
-                if stats['errors'] > 0:
-                    st.error(f"Errors: {stats['errors']}")
+    # Show active workers
+    num_workers = len(active_workers)
+    if num_workers > 0:
+        st.sidebar.success(f"Active Workers: {num_workers}")
+        
+        for worker in active_workers:
+            worker_id = worker.get('worker_id')
+            with st.sidebar.expander(f"Worker {worker_id} (Active)"):
+                st.text(f"Status: {worker.get('status', 'Unknown')}")
+                st.text(f"Address: {worker.get('address', 'Unknown')}")
+                if worker.get('current_task'):
+                    st.text(f"Current Task: {worker.get('current_task')}")
+                
+                # Add MongoDB stats if available
+                if worker_id in mongodb_workers:
+                    mongo_stats = mongodb_workers[worker_id]
+                    st.metric("Pages Crawled", mongo_stats.get('pages_crawled', 0))
+                    if mongo_stats.get('last_completed_url'):
+                        st.text(f"Last URL: {mongo_stats.get('last_completed_url')}")
     else:
-        st.sidebar.info("No worker activity recorded yet")
+        # Show inactive/historical workers
+        if mongodb_workers:
+            st.sidebar.warning("No Active Workers")
+            st.sidebar.info(f"Historical Workers: {len(mongodb_workers)}")
+            
+            for worker_id, stats in mongodb_workers.items():
+                with st.sidebar.expander(f"Worker {worker_id} ({stats.get('status', 'Unknown')})"):
+                    st.text(f"Status: {stats.get('status', 'Unknown')}")
+                    st.text(f"Address: {stats.get('address', 'Unknown')}")
+                    st.metric("Pages Crawled", stats.get('pages_crawled', 0))
+                    
+                    if stats.get('last_activity'):
+                        last_active = datetime.fromtimestamp(stats.get('last_activity'))
+                        st.text(f"Last Active: {last_active.strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    if stats.get('last_completed_url'):
+                        st.text(f"Last URL: {stats.get('last_completed_url')}")
+        else:
+            st.sidebar.warning("No Workers Found")
+            st.sidebar.info("Workers will appear here once they connect to the server.")
     
+    # Queue statistics
     st.sidebar.markdown("---")
-    st.sidebar.header("Service Controls")
-    url = st.sidebar.text_input("Enter URL to scrape", "http://books.toscrape.com/")
-    st.session_state['url'] = url
+    st.sidebar.header("Queue Statistics")
+    queue_stats = get_url_queue_stats()
+    
+    if queue_stats:
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            st.metric("Pending", queue_stats.get('pending', 0))
+            st.metric("Completed", queue_stats.get('completed', 0))
+        with col2:
+            st.metric("Processing", queue_stats.get('processing', 0))
+            st.metric("Failed", queue_stats.get('failed', 0))
+    else:
+        st.sidebar.info("No queue statistics available")
+    
+    # Server Controls
+    st.sidebar.markdown("---")
+    st.sidebar.header("Server Controls")
+    
+    # Server host/port configuration
+    with st.sidebar.expander("Server Configuration"):
+        new_host = st.text_input("Server Host", value=st.session_state.server_host)
+        new_port = st.number_input("Server Port", value=st.session_state.server_port, min_value=1024, max_value=65535)
+        
+        if st.button("Update Server Configuration"):
+            st.session_state.server_host = new_host
+            st.session_state.server_port = new_port
+            st.success("Server configuration updated")
+            st.rerun()
+    
+    # Server start/stop buttons
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if not st.session_state.server_started:
+            if st.button("Start Server", type="primary"):
+                if status['mongodb'] and status['rabbitmq']:
+                    if start_server_thread():
+                        st.rerun()
+                else:
+                    show_service_setup_instructions()
+        else:
+            st.info(f"Server running on {st.session_state.server_host}:{st.session_state.server_port}")
+    
+    with col2:
+        if st.session_state.server_started:
+            if st.button("Stop Server", type="secondary"):
+                if stop_server():
+                    st.rerun()
+    
+    # URL Seeding
+    st.sidebar.markdown("---")
+    if st.session_state.server_started:
+        url = st.sidebar.text_input("Start URL", value=st.session_state.url)
+        st.session_state.url = url
+        
+        # Update config with new URL
+        config = load_config()
+        if config and url != config.get('crawler', {}).get('start_url', ''):
+            if 'crawler' not in config:
+                config['crawler'] = {}
+            config['crawler']['start_url'] = url
+            save_config(config)
+        
+        if st.sidebar.button("Seed URL", type="primary"):
+            if seed_initial_urls():
+                st.rerun()
+    
+    # Worker Instructions
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Worker Connection Instructions"):
+        st.code(f"""
+        # To connect a worker from another machine:
+        python remote_worker.py --server {st.session_state.server_host} --port {st.session_state.server_port}
+        
+        # Optionally specify worker ID:
+        python remote_worker.py --server {st.session_state.server_host} --port {st.session_state.server_port} --id worker-custom-name
+        """)
+    
+    # Database management
+    st.sidebar.markdown("---")
+    st.sidebar.header("Database Management")
+    
     col1, col2 = st.sidebar.columns(2)
     
     with col1:
-        if not st.session_state.confirm_start:
-            if st.button("Start All Services", type="primary", key="start_services"):
-                st.session_state.confirm_start = True
-                st.session_state.show_worker_input = True
-                st.write("Start All Services button clicked!")
-                st.rerun()  # Force a rerun to update the UI
-        else:
-            if st.session_state.show_worker_input:
-                st.session_state.worker_count = st.number_input(
-                    "How many worker nodes do you want to create?",
-                    min_value=1,
-                    max_value=10,
-                    value=st.session_state.worker_count,
-                    key="worker_count_input"
+        if st.button("Clear Database", type="secondary"):
+            try:
+                client = pymongo.MongoClient("mongodb://localhost:27017/")
+                db = client["web_crawler"]
+                
+                # Count records before deletion
+                pages_count = db["pages"].count_documents({})
+                queue_count = db["url_queue"].count_documents({})
+                visited_count = db["visited_urls"].count_documents({})
+                
+                # Delete all records
+                db["pages"].delete_many({})
+                db["url_queue"].delete_many({})
+                db["visited_urls"].delete_many({})
+                
+                st.sidebar.success(f"Database cleared successfully! Removed {pages_count} pages, {queue_count} queued URLs, and {visited_count} visited URLs.")
+                
+                # Refresh the data in the dashboard
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error clearing database: {str(e)}")
+    
+    with col2:
+        if st.button("Stop Crawling", type="secondary"):
+            try:
+                client = pymongo.MongoClient("mongodb://localhost:27017/")
+                db = client["web_crawler"]
+                
+                # Count pending URLs before updating
+                pending_count = db["url_queue"].count_documents({"status": "pending"})
+                
+                # Update all pending URLs to cancelled
+                result = db["url_queue"].update_many(
+                    {"status": "pending"},
+                    {"$set": {"status": "cancelled"}}
                 )
-                if st.button("Confirm and Start All Services", type="secondary", key="confirm_services"):
-                    st.write("Confirm button clicked! Starting services...")
-                    if start_all_services():
-                        st.success("All services started successfully!")
-                        st.session_state.confirm_start = False
-                        st.session_state.show_worker_input = False
-                        st.rerun()  # Force a rerun to update the UI
-                    else:
-                        st.error("Failed to start services")
-                        st.session_state.confirm_start = False
-                        st.session_state.show_worker_input = False
-                        st.rerun()  # Force a rerun to update the UI
+                
+                # Show success message
+                modified_count = result.modified_count
+                st.sidebar.success(f"Stopped crawling! Cancelled {modified_count} pending URLs.")
+                
+                # Refresh the data in the dashboard
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error stopping crawl: {str(e)}")
     
-    with col2:
-        if st.button("Stop All Services", type="secondary", key="stop_services"):
-            st.write("Stop All Services button clicked!")
-            if stop_all_services():
-                st.success("All services stopped successfully!")
-                st.session_state.confirm_start = False
-                st.session_state.show_worker_input = False
-                st.rerun()  # Force a rerun to update the UI
-            else:
-                st.error("Failed to stop services")
+    st.sidebar.info("These actions can't be undone. Clear Database removes all data. Stop Crawling cancels pending URLs but keeps collected data.")
     
-    st.sidebar.markdown("---")
-    st.sidebar.header("Data Display")
-    df = load_data()
+    # Main content area
+    tab1, tab2, tab3 = st.tabs(["Dashboard", "Crawled Data", "Activity Log"])
     
-    if df.empty:
-        st.info("No valid data available. Please make sure the crawler has collected some data with valid prices.")
-        st.stop()
-    
-    st.sidebar.header("Filters")
-    if 'price' in df.columns and len(df) > 0:
-        min_price = float(df['price'].min())
-        max_price = float(df['price'].max())
+    with tab1:
+        st.header("System Dashboard")
         
-        if min_price == max_price:
-            st.sidebar.text(f"Fixed Price: ${min_price:.2f}")
-        else:
-            price_range = st.sidebar.slider(
-                "Price Range ($)",
-                min_value=min_price,
-                max_value=max_price,
-                value=(min_price, max_price),
-                step=0.01
-            )
-            df = df[(df['price'] >= price_range[0]) & (df['price'] <= price_range[1])]
-    
-    if 'category' in df.columns and not df['category'].empty:
-        categories = ['All'] + list(df['category'].unique())
-        selected_category = st.sidebar.selectbox("Category", categories)
-        if selected_category != 'All':
-            df = df[df['category'] == selected_category]
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("Product Overview")
-        for _, row in df.iterrows():
-            with st.expander(f"{row.get('title', 'Untitled')} - ${row.get('price', 'N/A')}"):
-                col1, col2 = st.columns([2, 1])
-                with col1:
-                    if 'description' in row:
-                        st.write("**Description:**")
-                        st.write(row['description'])
-                with col2:
-                    if 'ratings' in row:
-                        st.write("**Ratings:**")
-                        st.write(row['ratings'])
-                    if 'reviews' in row:
-                        st.write("**Reviews:**")
-                        st.write(row['reviews'])
-    
-    with col2:
-        st.subheader("Statistics")
-        st.metric("Total Products", len(df))
-        if 'price' in df.columns and not df['price'].empty:
-            st.metric("Average Price", f"${df['price'].mean():.2f}")
-            st.metric("Highest Price", f"${df['price'].max():.2f}")
-            st.metric("Lowest Price", f"${df['price'].min():.2f}")
-        if 'price' in df.columns and not df['price'].empty:
-            st.write("**Price Distribution**")
-            st.bar_chart(df['price'].value_counts().sort_index())
-        if 'category' in df.columns and not df['category'].empty:
-            st.write("**Category Distribution**")
-            st.bar_chart(df['category'].value_counts())
-    
-    st.subheader("Raw Data")
-    st.dataframe(df)
-    
-    st.subheader("Crawling Activity Logs")
-    logs = get_crawling_logs()
-    
-    if logs:
-        for log in logs:
-            timestamp = datetime.fromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-            if log['type'] == 'visited':
-                st.info(f"[{timestamp}] Worker {log['worker_id']} visited: {log['url']}")
+        # System status summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.subheader("Services")
+            for service, running in status.items():
+                if running:
+                    st.success(f"{service.capitalize()}: Running")
+                else:
+                    st.error(f"{service.capitalize()}: Not Running")
+        
+        with col2:
+            st.subheader("Workers")
+            st.metric("Active Workers", len(active_workers))
+            st.metric("Total Workers", len(mongodb_workers))
+        
+        with col3:
+            st.subheader("Queue")
+            st.metric("Pending URLs", queue_stats.get('pending', 0))
+            st.metric("Total URLs", queue_stats.get('total', 0))
+        
+        # URLs in queue
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.header("URLs in Queue")
+            try:
+                client = pymongo.MongoClient("mongodb://localhost:27017/")
+                db = client["web_crawler"]
+                pending_urls = list(db["url_queue"].find({"status": "pending"}).sort("timestamp", 1).limit(5))
+                
+                if pending_urls:
+                    for url in pending_urls:
+                        st.info(f"URL: {url.get('url')} (Depth: {url.get('depth')})")
+                else:
+                    st.info("No pending URLs in queue")
+            except Exception as e:
+                st.error(f"Error getting pending URLs: {str(e)}")
+        
+        with col2:
+            st.header("Worker Connection Events")
+            if st.session_state.worker_events:
+                # Display the most recent events first (up to 10)
+                for event in list(reversed(st.session_state.worker_events))[:10]:
+                    event_time = event['time'].strftime('%H:%M:%S')
+                    if event['type'] == 'connect':
+                        st.success(f"{event_time} - Worker connected (Total: {event['count']})")
+                    else:
+                        st.warning(f"{event_time} - Worker disconnected (Remaining: {event['count']})")
             else:
-                st.success(f"[{timestamp}] Worker {log['worker_id']} crawled: {log['url']} - {log.get('title', 'No title')} (${log.get('price', 'N/A')})")
-    else:
-        st.info("No crawling activity recorded yet")
+                st.info("No worker connection events recorded yet.")
+                
+            # Add a button to clear the event log
+            if st.button("Clear Event Log"):
+                st.session_state.worker_events = []
+                st.rerun()
+    
+    with tab2:
+        st.header("Crawled Data")
+        df = load_data()
+        
+        if df.empty:
+            st.info("No data available. Please run the crawler to collect data.")
+        else:
+            # Filter controls
+            st.subheader("Filters")
+            if 'price' in df.columns and len(df) > 0:
+                min_price = float(df['price'].min())
+                max_price = float(df['price'].max())
+                
+                if min_price == max_price:
+                    st.text(f"Fixed Price: ${min_price:.2f}")
+                else:
+                    price_range = st.slider(
+                        "Price Range ($)",
+                        min_value=min_price,
+                        max_value=max_price,
+                        value=(min_price, max_price),
+                        step=0.01
+                    )
+                    df = df[(df['price'] >= price_range[0]) & (df['price'] <= price_range[1])]
+            
+            if 'category' in df.columns and not df['category'].empty:
+                categories = ['All'] + list(df['category'].unique())
+                selected_category = st.selectbox("Category", categories)
+                if selected_category != 'All':
+                    df = df[df['category'] == selected_category]
+            
+            # Data display
+            st.subheader("Product Overview")
+            for _, row in df.iterrows():
+                with st.expander(f"{row.get('title', 'Untitled')} - ${row.get('price', 'N/A')}"):
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        if 'description' in row:
+                            st.write("**Description:**")
+                            st.write(row['description'])
+                    with col2:
+                        if 'rating' in row:
+                            st.write("**Rating:**")
+                            st.write(row['rating'])
+                        if 'availability' in row:
+                            st.write("**Availability:**")
+                            st.write(row['availability'])
+            
+            # Statistics
+            st.subheader("Statistics")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Products", len(df))
+                if 'price' in df.columns and not df['price'].empty:
+                    st.metric("Average Price", f"${df['price'].mean():.2f}")
+            
+            with col2:
+                if 'price' in df.columns and not df['price'].empty:
+                    st.metric("Highest Price", f"${df['price'].max():.2f}")
+                    st.metric("Lowest Price", f"${df['price'].min():.2f}")
+            
+            # Charts
+            if 'price' in df.columns and not df['price'].empty:
+                st.subheader("Price Distribution")
+                st.bar_chart(df['price'].value_counts().sort_index())
+            
+            if 'category' in df.columns and not df['category'].empty:
+                st.subheader("Category Distribution")
+                st.bar_chart(df['category'].value_counts())
+            
+            # Raw data table
+            with st.expander("Raw Data"):
+                st.dataframe(df)
+    
+    with tab3:
+        st.header("Activity Log")
+        logs = get_crawling_logs()
+        
+        if logs:
+            for log in logs:
+                timestamp = datetime.fromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                if log['type'] == 'visited':
+                    st.info(f"[{timestamp}] Worker {log['worker_id']} visited: {log['url']}")
+                else:
+                    st.success(f"[{timestamp}] Worker {log['worker_id']} crawled: {log['url']} - {log.get('title', 'No title')} (${log.get('price', 'N/A')})")
+        else:
+            st.info("No activity recorded yet")
 
 if __name__ == "__main__":
     main()
